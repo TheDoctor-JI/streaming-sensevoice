@@ -48,10 +48,8 @@ from loguru import logger
 
 import numpy as np
 
-import sys, uuid
-
-import soundfile as sf
-import io
+import json
+import uuid
 
 
 class Config(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=True):
@@ -169,6 +167,11 @@ async def clientHost():
     return FileResponse("realtime_ws_client.html", media_type="text/html")
 
 
+@app.get("/pcm-worklet-processor.js")
+async def worklet_module() -> FileResponse:
+    return FileResponse("pcm-worklet-processor.js", media_type="application/javascript")
+
+
 @app.websocket("/api/realtime/ws")
 async def websocket_endpoint(websocket: WebSocket):
     try:
@@ -255,22 +258,63 @@ async def websocket_endpoint(websocket: WebSocket):
 
         transcription_response: TranscriptionResponse = None
         while True:
-            data = await websocket.receive_bytes()
+            message = await websocket.receive()
 
-            # mp3 decode
-            buffer = io.BytesIO(data)
-            try:
-                buffer.name = "a.mp3"
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect()
 
-                samples, sr = sf.read(buffer, dtype="float32")
-                audio_buffer = np.concatenate((audio_buffer, samples))
-            except sf.LibsndfileError as e:
+            payload_bytes = message.get("bytes")
+            payload_text = message.get("text")
+
+            samples_i16: np.ndarray | None = None
+            samplerate = config.SAMPLERATE
+            encoding = "s16le"
+
+            if payload_bytes is not None:
+                if len(payload_bytes) % 2 != 0:
+                    logger.warning("Dropping trailing byte from odd-length audio payload")
+                    payload_bytes = payload_bytes[:-1]
+
+                samples_i16 = np.frombuffer(payload_bytes, dtype=np.int16)
+            elif payload_text is not None:
+                try:
+                    structured_payload = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    logger.warning("Received non-JSON text payload; ignoring")
+                    continue
+
+                if isinstance(structured_payload, dict):
+                    audio_field = structured_payload.get("audio")
+                    samplerate = structured_payload.get("sr", samplerate)
+                    encoding = structured_payload.get("enc", encoding)
+                else:
+                    audio_field = structured_payload
+
+                if samplerate != config.SAMPLERATE:
+                    raise ValueError("Sample rate mismatch")
+
+                if isinstance(audio_field, list):
+                    samples_i16 = np.asarray(audio_field, dtype=np.int16)
+                elif isinstance(audio_field, (bytes, bytearray)):
+                    if len(audio_field) % 2 != 0:
+                        logger.warning("Dropping trailing byte from odd-length audio payload")
+                        audio_field = audio_field[:-1]
+                    samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
+                else:
+                    logger.warning("Unsupported audio payload type: {}", type(audio_field))
+                    continue
+            else:
+                logger.warning("Received websocket frame without bytes or text payload; ignoring")
                 continue
-            finally:
-                buffer.close()
 
-            if sr != config.SAMPLERATE:
-                raise ValueError("Sample rate mismatch")
+            if samples_i16 is None or samples_i16.size == 0:
+                continue
+
+            if encoding and encoding.lower() not in ("s16le", "pcm16"):
+                raise ValueError(f"Unsupported audio encoding: {encoding}")
+
+            samples = samples_i16.astype(np.float32) / 32768.0
+            audio_buffer = np.concatenate((audio_buffer, samples))
 
             while len(audio_buffer) >= chunk_size:
                 chunk = audio_buffer[:chunk_size]
