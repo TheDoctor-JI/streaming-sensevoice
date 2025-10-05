@@ -61,7 +61,10 @@ class Config(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=Tr
     SENSEVOICE_MODEL_PATH: str = Field(
         "iic/SenseVoiceSmall", description="SenseVoice model path"
     )
-    DEVICE: str = Field("cpu", description="Device")
+    DEVICE: str = Field("cpu", description="Device (cpu, cuda)")
+    CUDA_DEVICE_INDEX: int | None = Field(
+        None, description="CUDA device index (e.g. 0 for cuda:0)"
+    )
     LANGUAGE: str = Field("auto", description="Default language (auto, zh, en, ja, ko, yue)")
     SILEROVAD_VERSION: str = Field("v5", description="SileroVAD version, v4 or v5")
     SAMPLERATE: int = Field(16000, description="Sample rate")
@@ -73,6 +76,55 @@ class Config(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=Tr
 
 
 config = Config()
+
+device_raw = config.DEVICE.strip()
+device_lower = device_raw.lower()
+
+if device_lower.startswith("cuda"):
+    sanitized_device = device_raw.replace(" ", "")
+    explicit_index: int | None = None
+
+    if ":" in sanitized_device:
+        _, suffix = sanitized_device.split(":", 1)
+        suffix = suffix.strip()
+        if suffix:
+            try:
+                explicit_index = int(suffix)
+            except ValueError as exc:
+                raise ValueError(
+                    "CUDA device index provided in DEVICE must be an integer"
+                ) from exc
+
+    chosen_index: int | None = (
+        explicit_index if explicit_index is not None else config.CUDA_DEVICE_INDEX
+    )
+
+    if chosen_index is not None:
+        if chosen_index < 0:
+            raise ValueError("CUDA device index must be non-negative")
+        normalized_device = f"cuda:{chosen_index}"
+    else:
+        normalized_device = "cuda"
+
+    config.DEVICE = normalized_device
+    config.CUDA_DEVICE_INDEX = chosen_index
+
+    if chosen_index is not None:
+        try:
+            import torch
+
+            torch.cuda.set_device(chosen_index)
+        except ImportError:
+            logger.warning(
+                "PyTorch with CUDA support is not available; unable to set CUDA device index"
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to select CUDA device index {chosen_index}: {exc}"
+            ) from exc
+else:
+    config.DEVICE = "cpu"
+    config.CUDA_DEVICE_INDEX = None
 
 app = FastAPI()
 
