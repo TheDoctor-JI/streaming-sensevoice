@@ -62,6 +62,7 @@ class Config(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=Tr
         "iic/SenseVoiceSmall", description="SenseVoice model path"
     )
     DEVICE: str = Field("cpu", description="Device")
+    LANGUAGE: str = Field("auto", description="Default language (auto, zh, en, ja, ko, yue)")
     SILEROVAD_VERSION: str = Field("v5", description="SileroVAD version, v4 or v5")
     SAMPLERATE: int = Field(16000, description="Sample rate")
     CHUNK_DURATION: float = Field(0.1, description="Chunk duration (s)")
@@ -134,10 +135,58 @@ async def websocket_endpoint(websocket: WebSocket):
                 "vad_min_silence_duration_ms", config.VAD_MIN_SILENCE_DURATION_MS
             )
         )
+        requested_language = query_params.get("language", [config.LANGUAGE])[0]
+        if requested_language:
+            requested_language = requested_language.lower()
+        else:
+            requested_language = config.LANGUAGE
 
-        sensevoice_model = StreamingSenseVoice(
-            model=config.SENSEVOICE_MODEL_PATH, device=config.DEVICE
-        )
+        available_languages: set[str] | None = None
+        try:
+            base_model, _ = StreamingSenseVoice.load_model(
+                model=config.SENSEVOICE_MODEL_PATH, device=config.DEVICE
+            )
+            available_languages = set(base_model.lid_dict.keys())
+        except Exception as exc:
+            logger.error(f"Failed to inspect available languages: {exc}")
+
+        if available_languages and requested_language not in available_languages:
+            message = {
+                "type": "Error",
+                "detail": (
+                    "Unsupported language. Available options: "
+                    f"{sorted(available_languages)}"
+                ),
+            }
+            await websocket.send_json(message)
+            await websocket.close(code=1003)
+            logger.warning(
+                f"Session {session_id} closed: unsupported language '{requested_language}'"
+            )
+            return
+
+        try:
+            sensevoice_model = StreamingSenseVoice(
+                model=config.SENSEVOICE_MODEL_PATH,
+                device=config.DEVICE,
+                language=requested_language,
+            )
+        except KeyError:
+            message = {
+                "type": "Error",
+                "detail": (
+                    "Unsupported language. Available options: "
+                    f"{sorted(available_languages) if available_languages else 'auto, zh, en, ja, ko, yue'}"
+                ),
+            }
+            await websocket.send_json(message)
+            await websocket.close(code=1003)
+            logger.warning(
+                f"Session {session_id} closed during model init: unsupported language '{requested_language}'",
+            )
+            return
+
+        logger.info(f"Session {session_id} configured with language='{requested_language}'")
         vad_iterator = VADIterator(
             version=config.SILEROVAD_VERSION,
             threshold=vad_threshold,
