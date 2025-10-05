@@ -181,6 +181,13 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info(f"Session {session_id} opened")
 
         query_params = parse_qs(websocket.scope["query_string"].decode())
+
+        for key in query_params:
+            if len(query_params[key]) == 0:
+                query_params[key] = None
+            elif len(query_params[key]) == 1:
+                query_params[key] = query_params[key][0] ## url parse will always return a list, we just want the first one if only one value
+
         chunk_duration = float(
             query_params.get("chunk_duration", config.CHUNK_DURATION)
         )
