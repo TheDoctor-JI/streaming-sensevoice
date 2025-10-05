@@ -9,4 +9,4 @@ torchaudio
 pydub
 onnx
 onnxconverter_common
-numpy==1.26.3
+
