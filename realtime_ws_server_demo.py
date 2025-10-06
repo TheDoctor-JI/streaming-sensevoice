@@ -52,6 +52,7 @@ import json
 import uuid
 import time
 
+import base64
 
 class Config(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=True):
     HOST: str = Field("127.0.0.1", description="Host")
@@ -166,6 +167,7 @@ class TranscriptionResponse(BaseModel):
     segment_start_s: float | None = None
     segment_end_s: float | None = None
     session_start_walltime: float | None = None
+    aud_seg_indx: int | None = None
 
 
 class VADEvent(BaseModel):
@@ -174,7 +176,7 @@ class VADEvent(BaseModel):
     segment_start_s: float | None = None
     segment_end_s: float | None = None
     session_start_walltime: float | None = None
-
+    aud_seg_indx: int | None = None
 
 @app.get("/")
 async def clientHost():
@@ -286,8 +288,10 @@ async def websocket_endpoint(websocket: WebSocket):
             if message.get("type") == "websocket.disconnect":
                 raise WebSocketDisconnect()
 
+            ## Due to the sequentialized operation here, this idx won't change asynchronously
             payload_bytes = message.get("bytes")
             payload_text = message.get("text")
+            aud_seg_indx = -1
 
             samples_i16: np.ndarray | None = None
             samplerate = config.SAMPLERATE
@@ -307,6 +311,14 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if isinstance(structured_payload, dict):
+
+                    aud_seg_indx_raw = structured_payload.get("seg_idx")
+                    if aud_seg_indx_raw is not None:
+                        try:
+                            aud_seg_indx = int(aud_seg_indx_raw)
+                        except (TypeError, ValueError):
+                            pass
+
                     audio_field = structured_payload.get("audio")
                     samplerate = structured_payload.get("sr", samplerate)
                     encoding = structured_payload.get("enc", encoding)
@@ -316,7 +328,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 if samplerate != config.SAMPLERATE:
                     raise ValueError("Sample rate mismatch")
 
-                if isinstance(audio_field, list):
+
+                if isinstance(audio_field, str):
+                    try:
+                        audio_field = base64.b64decode(audio_field)
+                    except Exception:
+                        logger.warning("Failed to decode base64 audio payload; ignoring")
+                        continue
+                    samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
+                elif isinstance(audio_field, list):
                     samples_i16 = np.asarray(audio_field, dtype=np.int16)
                 elif isinstance(audio_field, (bytes, bytearray)):
                     if len(audio_field) % 2 != 0:
@@ -366,6 +386,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 is_active=True,
                                 segment_start_s=currentAudioBeginTime,
                                 session_start_walltime=session_start_walltime,
+                                aud_seg_indx = aud_seg_indx
                             ).model_dump()
                         )
 
@@ -414,6 +435,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 segment_start_s=currentAudioBeginTime,
                                 segment_end_s=segment_end_s,
                                 session_start_walltime=session_start_walltime,
+                                aud_seg_indx = aud_seg_indx
                             )
                             await websocket.send_json(
                                 transcription_response.model_dump()
@@ -447,6 +469,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 segment_start_s=currentAudioBeginTime,
                                 segment_end_s=speech_dict["end"] / config.SAMPLERATE,
                                 session_start_walltime=session_start_walltime,
+                                aud_seg_indx = aud_seg_indx
                             ).model_dump()
                         )
 
