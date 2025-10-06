@@ -162,11 +162,19 @@ class TranscriptionResponse(BaseModel):
     data: TranscriptionChunk
     is_final: bool
     session_id: str | None = None
+    segment_start_s: float | None = None
+    segment_end_s: float | None = None
+    segment_start_ms: float | None = None
+    segment_end_ms: float | None = None
 
 
 class VADEvent(BaseModel):
     type: str = "VADEvent"
     is_active: bool
+    segment_start_s: float | None = None
+    segment_end_s: float | None = None
+    segment_start_ms: float | None = None
+    segment_end_ms: float | None = None
 
 
 @app.get("/")
@@ -352,7 +360,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         logger.debug(
                             f"{speech_count}: VAD start: {currentAudioBeginTime}"
                         )
-                        await websocket.send_json(VADEvent(is_active=True).model_dump())
+                        await websocket.send_json(
+                            VADEvent(
+                                is_active=True,
+                                segment_start_s=currentAudioBeginTime,
+                                segment_start_ms=currentAudioBeginTime * 1000.0,
+                            ).model_dump()
+                        )
 
                     is_last = "end" in speech_dict
 
@@ -364,10 +378,31 @@ async def websocket_endpoint(websocket: WebSocket):
                             asrDetected = True
 
                         if asrDetected:
+                            word_entries = res.get("word_timestamps") or []
+                            segment_end_s: float | None = None
+                            if word_entries:
+                                last_entry = word_entries[-1]
+                                last_end_ms = (
+                                    last_entry.get("end_ms")
+                                    or last_entry.get("end")
+                                )
+                                if last_end_ms is not None:
+                                    segment_end_s = currentAudioBeginTime + (last_end_ms / 1000.0)
+
+                            if segment_end_s is None:
+                                timestamps = res.get("timestamps") or []
+                                if timestamps:
+                                    segment_end_s = currentAudioBeginTime + (
+                                        timestamps[-1] / 1000.0
+                                    )
+
+                            if is_last and "end" in speech_dict:
+                                segment_end_s = speech_dict["end"] / config.SAMPLERATE
+
                             transcription_response = TranscriptionResponse(
                                 id=speech_count,
                                 begin_at=currentAudioBeginTime,
-                                end_at=None,
+                                end_at=segment_end_s,
                                 data=TranscriptionChunk(
                                     timestamps=res["timestamps"],
                                     raw_text=res["text"],
@@ -375,6 +410,12 @@ async def websocket_endpoint(websocket: WebSocket):
                                 ),
                                 is_final=False,
                                 session_id=session_id,
+                                segment_start_s=currentAudioBeginTime,
+                                segment_end_s=segment_end_s,
+                                segment_start_ms=currentAudioBeginTime * 1000.0,
+                                segment_end_ms=(
+                                    segment_end_s * 1000.0 if segment_end_s is not None else None
+                                ),
                             )
                             await websocket.send_json(
                                 transcription_response.model_dump()
@@ -389,6 +430,12 @@ async def websocket_endpoint(websocket: WebSocket):
                             transcription_response.end_at = (
                                 speech_dict["end"] / config.SAMPLERATE
                             )
+                            transcription_response.segment_end_s = (
+                                speech_dict["end"] / config.SAMPLERATE
+                            )
+                            transcription_response.segment_end_ms = (
+                                transcription_response.segment_end_s * 1000.0
+                            )
 
                             await websocket.send_json(
                                 transcription_response.model_dump()
@@ -401,7 +448,13 @@ async def websocket_endpoint(websocket: WebSocket):
                                 f"{speech_count}: VAD end: {speech_dict['end'] / config.SAMPLERATE}\nNo Speech"
                             )
                         await websocket.send_json(
-                            VADEvent(is_active=False).model_dump()
+                            VADEvent(
+                                is_active=False,
+                                segment_start_s=currentAudioBeginTime,
+                                segment_end_s=speech_dict["end"] / config.SAMPLERATE,
+                                segment_start_ms=currentAudioBeginTime * 1000.0,
+                                segment_end_ms=(speech_dict["end"] / config.SAMPLERATE) * 1000.0,
+                            ).model_dump()
                         )
 
     except WebSocketDisconnect:
