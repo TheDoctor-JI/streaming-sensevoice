@@ -50,6 +50,7 @@ import numpy as np
 
 import json
 import uuid
+import time
 
 
 class Config(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=True):
@@ -164,8 +165,7 @@ class TranscriptionResponse(BaseModel):
     session_id: str | None = None
     segment_start_s: float | None = None
     segment_end_s: float | None = None
-    segment_start_ms: float | None = None
-    segment_end_ms: float | None = None
+    session_start_walltime: float | None = None
 
 
 class VADEvent(BaseModel):
@@ -173,8 +173,7 @@ class VADEvent(BaseModel):
     is_active: bool
     segment_start_s: float | None = None
     segment_end_s: float | None = None
-    segment_start_ms: float | None = None
-    segment_end_ms: float | None = None
+    session_start_walltime: float | None = None
 
 
 @app.get("/")
@@ -192,6 +191,8 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         await websocket.accept()
 
+        session_start_walltime = time.time()
+        
         session_id = str(uuid.uuid4())
         logger.info(f"Session {session_id} opened")
 
@@ -364,7 +365,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             VADEvent(
                                 is_active=True,
                                 segment_start_s=currentAudioBeginTime,
-                                segment_start_ms=currentAudioBeginTime * 1000.0,
+                                session_start_walltime=session_start_walltime,
                             ).model_dump()
                         )
 
@@ -412,10 +413,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 session_id=session_id,
                                 segment_start_s=currentAudioBeginTime,
                                 segment_end_s=segment_end_s,
-                                segment_start_ms=currentAudioBeginTime * 1000.0,
-                                segment_end_ms=(
-                                    segment_end_s * 1000.0 if segment_end_s is not None else None
-                                ),
+                                session_start_walltime=session_start_walltime,
                             )
                             await websocket.send_json(
                                 transcription_response.model_dump()
@@ -433,10 +431,6 @@ async def websocket_endpoint(websocket: WebSocket):
                             transcription_response.segment_end_s = (
                                 speech_dict["end"] / config.SAMPLERATE
                             )
-                            transcription_response.segment_end_ms = (
-                                transcription_response.segment_end_s * 1000.0
-                            )
-
                             await websocket.send_json(
                                 transcription_response.model_dump()
                             )
@@ -452,8 +446,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 is_active=False,
                                 segment_start_s=currentAudioBeginTime,
                                 segment_end_s=speech_dict["end"] / config.SAMPLERATE,
-                                segment_start_ms=currentAudioBeginTime * 1000.0,
-                                segment_end_ms=(speech_dict["end"] / config.SAMPLERATE) * 1000.0,
+                                session_start_walltime=session_start_walltime,
                             ).model_dump()
                         )
 
