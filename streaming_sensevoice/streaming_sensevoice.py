@@ -15,6 +15,8 @@
 from functools import partial
 from typing import List
 
+import re
+
 import torch
 from asr_decoder import CTCDecoder
 from funasr import AutoModel
@@ -23,6 +25,11 @@ from online_fbank import OnlineFbank
 import numpy as np
 
 from .sensevoice import SenseVoiceSmall
+
+
+CJK_CHAR_PATTERN = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]"
+)
 
 
 sensevoice_models = {}
@@ -142,25 +149,85 @@ class StreamingSenseVoice:
         current_word_pieces = []
         current_word_times = []
 
+        def contains_cjk(text: str) -> bool:
+            return bool(CJK_CHAR_PATTERN.search(text))
+
         def flush_word():
             if not current_word_pieces:
                 return
 
-            word = "".join(current_word_pieces).strip()
-            if not word:
+            token_surfaces = current_word_pieces[:]
+            token_times = current_word_times[:]
+
+            combined_surface = "".join(token_surfaces)
+            normalized_combined = combined_surface.strip()
+            if not normalized_combined:
                 current_word_pieces.clear()
                 current_word_times.clear()
                 return
 
-            start_ms = float(current_word_times[0])
-            end_ms = float(current_word_times[-1] + 60)
-            word_entries.append(
-                {
-                    "word": word,
-                    "start_ms": start_ms,
-                    "end_ms": end_ms,
-                }
-            )
+            overall_start = float(token_times[0])
+            overall_end = float(token_times[-1] + 60)
+            cluster_has_cjk = any(contains_cjk(surface) for surface in token_surfaces)
+
+            if cluster_has_cjk:
+                token_end_times = [
+                    float(token_times[idx + 1]) if idx + 1 < len(token_times) else overall_end
+                    for idx in range(len(token_times))
+                ]
+
+                for idx, surface in enumerate(token_surfaces):
+                    start_ms = float(token_times[idx])
+                    end_ms = token_end_times[idx]
+                    if end_ms < start_ms:
+                        end_ms = start_ms
+
+                    if contains_cjk(surface):
+                        characters = [char for char in surface if char.strip()]
+                        if not characters:
+                            continue
+
+                        span = end_ms - start_ms
+                        if len(characters) == 1 or span <= 0:
+                            word_entries.append(
+                                {
+                                    "word": characters[0],
+                                    "start_ms": start_ms,
+                                    "end_ms": end_ms,
+                                }
+                            )
+                        else:
+                            step = span / len(characters)
+                            for char_idx, char in enumerate(characters):
+                                char_start = start_ms + step * char_idx
+                                char_end = start_ms + step * (char_idx + 1)
+                                word_entries.append(
+                                    {
+                                        "word": char,
+                                        "start_ms": char_start,
+                                        "end_ms": char_end,
+                                    }
+                                )
+                    else:
+                        cleaned = surface.strip()
+                        if not cleaned:
+                            continue
+                        word_entries.append(
+                            {
+                                "word": cleaned,
+                                "start_ms": start_ms,
+                                "end_ms": end_ms,
+                            }
+                        )
+            else:
+                word_entries.append(
+                    {
+                        "word": normalized_combined,
+                        "start_ms": overall_start,
+                        "end_ms": overall_end,
+                    }
+                )
+
             current_word_pieces.clear()
             current_word_times.clear()
 

@@ -104,6 +104,47 @@
         font-size: 12px;
         color: #555;
       }
+
+      .wordTimeline {
+        grid-column: 2 / 3;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 4px;
+      }
+
+      .wordTag {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 8px;
+        border-radius: 12px;
+        background: #ffffff;
+        border: 1px solid #dcdcdc;
+        font-size: 12px;
+        line-height: 1.2;
+        cursor: default;
+      }
+
+      .wordTag.final {
+        border-color: #b3e5fc;
+        background: #e1f5fe;
+      }
+
+      .wordTag.live {
+        border-color: #ffe0b2;
+        background: #fff3e0;
+      }
+
+      .wordTag:hover {
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      }
+
+      .wordTime {
+        font-family: monospace;
+        color: #616161;
+        font-size: 11px;
+      }
     </style>
   </head>
   <body>
@@ -207,6 +248,135 @@
       }
     };
 
+    function formatSecondsLabel(seconds) {
+      if (seconds === null || seconds === undefined || Number.isNaN(seconds)) {
+        return "—";
+      }
+      return `${seconds.toFixed(2)}s`;
+    }
+
+    function formatTimeRange(relativeStart, relativeEnd) {
+      if (
+        relativeStart === null ||
+        relativeStart === undefined ||
+        Number.isNaN(relativeStart)
+      ) {
+        return "—";
+      }
+
+      const startLabel = formatSecondsLabel(relativeStart);
+      if (relativeEnd === null || relativeEnd === undefined || Number.isNaN(relativeEnd)) {
+        return `+${startLabel}`;
+      }
+
+      return `+${startLabel} → +${formatSecondsLabel(relativeEnd)}`;
+    }
+
+    function buildWordTimeline(transcription) {
+      const wordEntries = transcription?.data?.word_timestamps;
+      if (!Array.isArray(wordEntries) || wordEntries.length === 0) {
+        return null;
+      }
+
+      const segmentStart = Number(
+        transcription.segment_start_s ?? transcription.begin_at ?? 0
+      );
+      const isFinal = Boolean(transcription.is_final);
+
+      const timeline = document.createElement("div");
+      timeline.classList.add("wordTimeline");
+
+      wordEntries.forEach((entry) => {
+        const wordText = entry?.word ?? "";
+        if (!wordText) {
+          return;
+        }
+
+        const startMs = Number(
+          entry.start_ms ?? (entry.start !== undefined ? entry.start * 1000 : NaN)
+        );
+        const endMs = Number(
+          entry.end_ms ?? (entry.end !== undefined ? entry.end * 1000 : NaN)
+        );
+
+        const relStart = Number.isFinite(startMs) ? startMs / 1000 : null;
+        const relEnd = Number.isFinite(endMs) ? endMs / 1000 : null;
+
+        const absStart = relStart !== null ? segmentStart + relStart : null;
+        const absEnd = relEnd !== null ? segmentStart + relEnd : null;
+
+        const tag = document.createElement("span");
+        tag.classList.add("wordTag");
+        tag.classList.add(isFinal ? "final" : "live");
+        tag.dataset.relativeStart = relStart !== null ? relStart.toFixed(3) : "";
+        tag.dataset.relativeEnd = relEnd !== null ? relEnd.toFixed(3) : "";
+        tag.dataset.absoluteStart = absStart !== null ? absStart.toFixed(3) : "";
+        tag.dataset.absoluteEnd = absEnd !== null ? absEnd.toFixed(3) : "";
+
+        const titleParts = [`Word: ${wordText}`];
+        if (relStart !== null) {
+          titleParts.push(`Segment +${formatSecondsLabel(relStart)}`);
+        }
+        if (relEnd !== null) {
+          titleParts.push(`→ +${formatSecondsLabel(relEnd)}`);
+        }
+        if (absStart !== null) {
+          titleParts.push(`Abs ${formatSecondsLabel(absStart)}`);
+        }
+        if (absEnd !== null) {
+          titleParts.push(`→ ${formatSecondsLabel(absEnd)}`);
+        }
+        tag.title = titleParts.join(" | ");
+
+        const wordSpan = document.createElement("span");
+        wordSpan.textContent = wordText;
+
+        const timeSpan = document.createElement("span");
+        timeSpan.classList.add("wordTime");
+        timeSpan.textContent = formatTimeRange(relStart, relEnd);
+
+        tag.appendChild(wordSpan);
+        tag.appendChild(timeSpan);
+
+        tag.addEventListener("click", () => {
+          const parts = [`${wordText}`];
+          if (relStart !== null) {
+            parts.push(`segment +${formatSecondsLabel(relStart)}`);
+          }
+          if (relEnd !== null) {
+            parts.push(`→ +${formatSecondsLabel(relEnd)}`);
+          }
+          if (absStart !== null) {
+            parts.push(`abs ${formatSecondsLabel(absStart)}`);
+          }
+          if (absEnd !== null) {
+            parts.push(`→ ${formatSecondsLabel(absEnd)}`);
+          }
+          const detail = parts.join(" | ");
+          if (audioInfo) {
+            audioInfo.textContent = `Word detail: ${detail}`;
+          }
+          if (typeof window !== "undefined" && window.console) {
+            window.console.debug("[WordTimestamp]", {
+              word: wordText,
+              relStart,
+              relEnd,
+              absStart,
+              absEnd,
+            });
+          }
+        });
+
+        timeline.appendChild(tag);
+      });
+
+      if (!timeline.childElementCount) {
+        return null;
+      }
+
+      return timeline;
+    }
+
     function renderTranscrionResult(transcriptionList) {
       const fragment = document.createDocumentFragment();
       transcriptionList.forEach((transcription) => {
@@ -232,6 +402,11 @@
           );
           timeEle.classList.add("transTime");
           root.appendChild(timeEle);
+
+          const wordTimeline = buildWordTimeline(transcription);
+          if (wordTimeline) {
+            root.appendChild(wordTimeline);
+          }
         } else {
           const idEle = document.createElement("div");
           idEle.appendChild(document.createTextNode(transcription.id));
@@ -253,6 +428,11 @@
           root.appendChild(timeEle);
 
           root.classList.add("isActive");
+
+          const wordTimeline = buildWordTimeline(transcription);
+          if (wordTimeline) {
+            root.appendChild(wordTimeline);
+          }
         }
         fragment.appendChild(root);
       });
