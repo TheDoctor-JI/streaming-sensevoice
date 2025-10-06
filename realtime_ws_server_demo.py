@@ -90,11 +90,18 @@ from streaming_sensevoice import StreamingSenseVoice
 StreamingSenseVoice.load_model(model=config.SENSEVOICE_MODEL_PATH, device=config.DEVICE)
 
 
+class WordTimestamp(BaseModel):
+    word: str
+    start_ms: float
+    end_ms: float | None = None
+
+
 class TranscriptionChunk(BaseModel):
     timestamps: list[int]
     raw_text: str
     final_text: str | None = None
     spk_id: int | None = None
+    word_timestamps: list[WordTimestamp] | None = None
 
 
 class TranscriptionResponse(BaseModel):
@@ -259,7 +266,9 @@ async def websocket_endpoint(websocket: WebSocket):
                                 begin_at=currentAudioBeginTime,
                                 end_at=None,
                                 data=TranscriptionChunk(
-                                    timestamps=res["timestamps"], raw_text=res["text"]
+                                    timestamps=res["timestamps"],
+                                    raw_text=res["text"],
+                                    word_timestamps=res.get("word_timestamps"),
                                 ),
                                 is_final=False,
                                 session_id=session_id,

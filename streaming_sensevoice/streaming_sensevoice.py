@@ -86,6 +86,23 @@ class StreamingSenseVoice:
         self.caches = torch.zeros(self.caches_shape)
         self.zeros = np.zeros((1, kwargs["input_size"]), dtype=float)
 
+    def _id_to_piece(self, token_id: int) -> str:
+        token_id = int(token_id)
+        converter = getattr(self.tokenizer, "convert_ids_to_tokens", None)
+        if callable(converter):
+            return converter(token_id)
+
+        for attr_name in ("sp_model", "sp", "sentencepiece"):  # pragma: no branch
+            sp_model = getattr(self.tokenizer, attr_name, None)
+            if sp_model and hasattr(sp_model, "id_to_piece"):
+                return sp_model.id_to_piece(token_id)
+
+        inner = getattr(self.tokenizer, "tokenizer", None)
+        if inner and hasattr(inner, "id_to_piece"):
+            return inner.id_to_piece(token_id)
+
+        return ""
+
     @staticmethod
     def load_model(model: str, device: str) -> tuple:
         key = f"{model}-{device}"
@@ -120,11 +137,58 @@ class StreamingSenseVoice:
 
     def decode(self, times, tokens):
         times_ms = []
-        for step, token in zip(times, tokens):
-            if len(self.tokenizer.decode(token).strip()) == 0:
+        word_entries = []
+
+        current_word_pieces = []
+        current_word_times = []
+
+        def flush_word():
+            if not current_word_pieces:
+                return
+
+            word = "".join(current_word_pieces).strip()
+            if not word:
+                current_word_pieces.clear()
+                current_word_times.clear()
+                return
+
+            start_ms = float(current_word_times[0])
+            end_ms = float(current_word_times[-1] + 60)
+            word_entries.append(
+                {
+                    "word": word,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                }
+            )
+            current_word_pieces.clear()
+            current_word_times.clear()
+
+        int_tokens = [int(t) for t in tokens]
+
+        for step, token_id in zip(times, int_tokens):
+            piece = self._id_to_piece(token_id)
+            decoded_piece = self.tokenizer.decode([token_id])
+            if len(decoded_piece.strip()) == 0:
                 continue
-            times_ms.append(step * 60)
-        return times_ms, self.tokenizer.decode(tokens)
+
+            token_time_ms = step * 60
+            times_ms.append(token_time_ms)
+
+            starts_new_word = piece.startswith("▁") or not current_word_pieces
+            if starts_new_word and current_word_pieces:
+                flush_word()
+
+            if starts_new_word:
+                normalized_piece = decoded_piece.lstrip()
+            else:
+                normalized_piece = decoded_piece
+
+            current_word_pieces.append(normalized_piece)
+            current_word_times.append(token_time_ms)
+
+        flush_word()
+        return times_ms, self.tokenizer.decode(int_tokens), word_entries
 
     def streaming_inference(self, audio, is_last):
         self.fbank.accept_waveform(audio, is_last)
@@ -150,8 +214,16 @@ class StreamingSenseVoice:
                 res = self.decoder.ctc_prefix_beam_search(
                     probs, beam_size=self.beam_size, is_last=is_last
                 )
-                times_ms, text = self.decode(res["times"][0], res["tokens"][0])
+                times_ms, text, word_entries = self.decode(
+                    res["times"][0], res["tokens"][0]
+                )
             else:
                 res = self.decoder.ctc_greedy_search(probs, is_last=is_last)
-                times_ms, text = self.decode(res["times"], res["tokens"])
-            yield {"timestamps": times_ms, "text": text}
+                times_ms, text, word_entries = self.decode(
+                    res["times"], res["tokens"]
+                )
+            yield {
+                "timestamps": times_ms,
+                "text": text,
+                "word_timestamps": word_entries,
+            }
