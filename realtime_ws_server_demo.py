@@ -280,6 +280,10 @@ async def websocket_endpoint(websocket: WebSocket):
         currentAudioBeginTime = 0.0
 
         asrDetected = False
+        in_speech = False  # Track if currently inside an IPU
+        current_seg_idx = -1  # Track current audio message segment index
+        force_cutoff_pending = False  # Track if force cutoff is pending
+        force_cutoff_target_seg = -1  # Track target segment for force cutoff
 
         transcription_response: TranscriptionResponse = None
         while True:
@@ -311,53 +315,93 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if isinstance(structured_payload, dict):
-
-                    aud_seg_indx_raw = structured_payload.get("seg_idx")
-                    if aud_seg_indx_raw is not None:
+                    # Check for force cutoff command first
+                    command = structured_payload.get("command")
+                    if command == "force_vad_offset":
+                        seg_idx_str = structured_payload.get("cutoff_target_seg_idx")
                         try:
-                            aud_seg_indx = int(aud_seg_indx_raw)
+                            force_cutoff_target_seg = int(seg_idx_str)
+                            force_cutoff_pending = True
+                            logger.info(f"Force VAD cutoff command received for seg_idx={force_cutoff_target_seg}")
+                            # Skip audio extraction and jump directly to buffer processing
+                            samples_i16 = None
                         except (TypeError, ValueError):
-                            pass
+                            logger.warning(f"Invalid seg_idx in force_vad_offset: {seg_idx_str}")
+                            continue
+                    else:
+                        aud_seg_indx_raw = structured_payload.get("seg_idx")
+                        if aud_seg_indx_raw is not None:
+                            try:
+                                aud_seg_indx = int(aud_seg_indx_raw)
+                                # Update current segment index
+                                if aud_seg_indx >= 0:
+                                    current_seg_idx = aud_seg_indx
+                            except (TypeError, ValueError):
+                                pass
 
-                    audio_field = structured_payload.get("audio")
-                    samplerate = structured_payload.get("sr", samplerate)
-                    encoding = structured_payload.get("enc", encoding)
+                        # Skip audio extraction if force cutoff command was received
+                        if samples_i16 is None:
+                            # Force cutoff command received - skip all audio extraction
+                            pass
+                        else:
+                            audio_field = structured_payload.get("audio")
+                            samplerate = structured_payload.get("sr", samplerate)
+                            encoding = structured_payload.get("enc", encoding)
+
+                            if samplerate != config.SAMPLERATE:
+                                raise ValueError("Sample rate mismatch")
+
+                            if isinstance(audio_field, str):
+                                try:
+                                    audio_field = base64.b64decode(audio_field)
+                                except Exception:
+                                    logger.warning("Failed to decode base64 audio payload; ignoring")
+                                    continue
+                                samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
+                            elif isinstance(audio_field, list):
+                                samples_i16 = np.asarray(audio_field, dtype=np.int16)
+                            elif isinstance(audio_field, (bytes, bytearray)):
+                                if len(audio_field) % 2 != 0:
+                                    logger.warning("Dropping trailing byte from odd-length audio payload")
+                                    audio_field = audio_field[:-1]
+                                samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
+                            else:
+                                logger.warning("Unsupported audio payload type: {}", type(audio_field))
+                                continue
                 else:
                     audio_field = structured_payload
 
-                if samplerate != config.SAMPLERATE:
-                    raise ValueError("Sample rate mismatch")
+                    if samplerate != config.SAMPLERATE:
+                        raise ValueError("Sample rate mismatch")
 
-
-                if isinstance(audio_field, str):
-                    try:
-                        audio_field = base64.b64decode(audio_field)
-                    except Exception:
-                        logger.warning("Failed to decode base64 audio payload; ignoring")
+                    if isinstance(audio_field, str):
+                        try:
+                            audio_field = base64.b64decode(audio_field)
+                        except Exception:
+                            logger.warning("Failed to decode base64 audio payload; ignoring")
+                            continue
+                        samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
+                    elif isinstance(audio_field, list):
+                        samples_i16 = np.asarray(audio_field, dtype=np.int16)
+                    elif isinstance(audio_field, (bytes, bytearray)):
+                        if len(audio_field) % 2 != 0:
+                            logger.warning("Dropping trailing byte from odd-length audio payload")
+                            audio_field = audio_field[:-1]
+                        samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
+                    else:
+                        logger.warning("Unsupported audio payload type: {}", type(audio_field))
                         continue
-                    samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
-                elif isinstance(audio_field, list):
-                    samples_i16 = np.asarray(audio_field, dtype=np.int16)
-                elif isinstance(audio_field, (bytes, bytearray)):
-                    if len(audio_field) % 2 != 0:
-                        logger.warning("Dropping trailing byte from odd-length audio payload")
-                        audio_field = audio_field[:-1]
-                    samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
-                else:
-                    logger.warning("Unsupported audio payload type: {}", type(audio_field))
-                    continue
             else:
                 logger.warning("Received websocket frame without bytes or text payload; ignoring")
                 continue
 
-            if samples_i16 is None or samples_i16.size == 0:
-                continue
+            # Add audio to buffer if we have samples (skip if force cutoff command)
+            if samples_i16 is not None and samples_i16.size > 0:
+                if encoding and encoding.lower() not in ("s16le", "pcm16"):
+                    raise ValueError(f"Unsupported audio encoding: {encoding}")
 
-            if encoding and encoding.lower() not in ("s16le", "pcm16"):
-                raise ValueError(f"Unsupported audio encoding: {encoding}")
-
-            samples = samples_i16.astype(np.float32) / 32768.0
-            audio_buffer = np.concatenate((audio_buffer, samples))
+                samples = samples_i16.astype(np.float32) / 32768.0
+                audio_buffer = np.concatenate((audio_buffer, samples))
 
             while len(audio_buffer) >= chunk_size:
                 chunk = audio_buffer[:chunk_size]
@@ -377,6 +421,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             )
                             speech_count += 1
                         asrDetected = False
+                        in_speech = True  # Track that we're now in speech
 
                         logger.debug(
                             f"{speech_count}: VAD start: {currentAudioBeginTime}"
@@ -442,6 +487,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             )
 
                     if is_last:
+                        in_speech = False  # Track that speech has ended
                         if asrDetected:
                             speech_count += 1
                             asrDetected = False
@@ -472,6 +518,84 @@ async def websocket_endpoint(websocket: WebSocket):
                                 aud_seg_indx = aud_seg_indx
                             ).model_dump()
                         )
+
+            # Execute force cutoff after all audio processing in this iteration
+            if force_cutoff_pending and current_seg_idx == force_cutoff_target_seg:
+                logger.info(f"Executing force cutoff for seg_idx={force_cutoff_target_seg}, in_speech={in_speech}")
+                
+                # Only cutoff if we're actually in speech
+                if in_speech:
+                    # Force ASR to return final hypothesis
+                    empty_samples = np.array([], dtype=np.float32)
+                    for res in sensevoice_model.streaming_inference(empty_samples, is_last=True):
+                        if len(res["text"]) > 0 or asrDetected:
+                            # Calculate segment end time from word timestamps
+                            word_entries = res.get("word_timestamps") or []
+                            segment_end_s: float | None = None
+                            
+                            if word_entries:
+                                last_entry = word_entries[-1]
+                                last_end_ms = last_entry.get("end_ms") or last_entry.get("end")
+                                if last_end_ms is not None:
+                                    segment_end_s = currentAudioBeginTime + (last_end_ms / 1000.0)
+                            
+                            if segment_end_s is None:
+                                timestamps = res.get("timestamps") or []
+                                if timestamps:
+                                    segment_end_s = currentAudioBeginTime + (timestamps[-1] / 1000.0)
+                            
+                            # Send partial transcript (is_final=False as requested)
+                            transcription_response = TranscriptionResponse(
+                                id=speech_count,
+                                begin_at=currentAudioBeginTime,
+                                end_at=segment_end_s,
+                                data=TranscriptionChunk(
+                                    timestamps=res["timestamps"],
+                                    raw_text=res["text"],
+                                    word_timestamps=res.get("word_timestamps"),
+                                ),
+                                is_final=False,  # Don't force finalize
+                                session_id=session_id,
+                                segment_start_s=currentAudioBeginTime,
+                                segment_end_s=segment_end_s,
+                                session_start_walltime=session_start_walltime,
+                                aud_seg_indx=force_cutoff_target_seg
+                            )
+                            await websocket.send_json(transcription_response.model_dump())
+                            logger.debug(f"Force cutoff: sent partial transcript for seg_idx={force_cutoff_target_seg}")
+                    
+                    # Emit VAD offset event
+                    await websocket.send_json(
+                        VADEvent(
+                            is_active=False,
+                            segment_start_s=currentAudioBeginTime,
+                            segment_end_s=segment_end_s,
+                            session_start_walltime=session_start_walltime,
+                            aud_seg_indx=force_cutoff_target_seg
+                        ).model_dump()
+                    )
+                    logger.debug(f"Force cutoff: sent VAD offset for seg_idx={force_cutoff_target_seg}")
+                    
+                    # Reset VAD state by creating new iterator
+                    vad_iterator = VADIterator(
+                        version=config.SILEROVAD_VERSION,
+                        threshold=vad_threshold,
+                        min_silence_duration_ms=vad_min_silence_duration_ms,
+                    )
+                    
+                    # Reset ASR state
+                    sensevoice_model.reset()
+                    
+                    # Update state
+                    speech_count += 1
+                    asrDetected = False
+                    in_speech = False
+                    
+                    logger.info(f"Force cutoff executed: segment ended at {segment_end_s}s")
+                
+                # Clear flags and discard remaining audio buffer
+                force_cutoff_pending = False
+                audio_buffer = np.array([], dtype=np.float32)
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
