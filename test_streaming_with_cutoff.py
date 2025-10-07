@@ -4,10 +4,11 @@ import json
 import wave
 import numpy as np
 import time
-import base64
+import struct
 from pathlib import Path
 import argparse
 from typing import List, Dict, Any
+import base64  # Add this import
 
 class StreamingASRTester:
     def __init__(
@@ -15,32 +16,31 @@ class StreamingASRTester:
         server_url: str = "ws://127.0.0.1:8000/api/realtime/ws",
         chunk_duration: float = 0.1,
         sample_rate: int = 16000,
-        force_offset_timing: float = None,  # Seconds after connection to send force offset
-        streaming_speed_multiplier: float = 10.0,  # Stream faster than realtime
+        force_offset_timing: float = None,
     ):
+        # Add query parameters if needed
+        if '?' not in server_url:
+            server_url = f"{server_url}?chunk_duration={chunk_duration}"
+        
         self.server_url = server_url
         self.chunk_duration = chunk_duration
         self.sample_rate = sample_rate
         self.chunk_size_samples = int(chunk_duration * sample_rate)
-        self.chunk_size_bytes = self.chunk_size_samples * 2  # 2 bytes per s16le sample
+        self.chunk_size_bytes = self.chunk_size_samples * 2
         self.force_offset_timing = force_offset_timing
-        self.streaming_speed_multiplier = streaming_speed_multiplier
         
-        # Storage for results
         self.vad_events: List[Dict[str, Any]] = []
         self.transcription_updates: List[Dict[str, Any]] = []
         self.streamed_audio: List[np.ndarray] = []
-        self.total_audio_duration_sent = 0.0  # Track audio duration sent to server
+        self.total_audio_duration_sent = 0.0
         
     def load_audio_file(self, filepath: str) -> np.ndarray:
         """Load WAV file and return as int16 numpy array"""
         with wave.open(filepath, 'rb') as wf:
-            # Verify format
             assert wf.getnchannels() == 1, "Only mono audio supported"
             assert wf.getsampwidth() == 2, "Only 16-bit audio supported"
             assert wf.getframerate() == self.sample_rate, f"Sample rate must be {self.sample_rate}"
             
-            # Read all frames
             frames = wf.readframes(wf.getnframes())
             audio_data = np.frombuffer(frames, dtype=np.int16)
             
@@ -51,17 +51,14 @@ class StreamingASRTester:
         chunks = []
         num_full_chunks = len(audio_data) // self.chunk_size_samples
         
-        # Process full chunks
         for i in range(num_full_chunks):
             start = i * self.chunk_size_samples
             end = start + self.chunk_size_samples
             chunks.append(audio_data[start:end])
         
-        # Handle remaining samples
         remaining_samples = len(audio_data) % self.chunk_size_samples
         if remaining_samples > 0:
             last_chunk = audio_data[num_full_chunks * self.chunk_size_samples:]
-            # Pad with zeros (silence)
             padding = np.zeros(self.chunk_size_samples - remaining_samples, dtype=np.int16)
             padded_chunk = np.concatenate([last_chunk, padding])
             chunks.append(padded_chunk)
@@ -70,11 +67,29 @@ class StreamingASRTester:
 
     async def receive_messages(self, websocket):
         """Continuously receive and store messages from server"""
+        message_count = 0
         try:
+            print("[RECEIVER] Starting to listen for messages...")
             while True:
                 message = await websocket.recv()
-                data = json.loads(message)
+                message_count += 1
                 
+                # Handle both binary and text messages
+                if isinstance(message, bytes):
+                    try:
+                        message = message.decode('utf-8')
+                    except UnicodeDecodeError:
+                        print(f"[RECEIVER] Received non-text binary message #{message_count}")
+                        continue
+                
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    print(f"[RECEIVER] Received non-JSON message #{message_count}: {message[:100]}")
+                    continue
+                
+                print(f'[RECEIVER] Received message #{message_count}: {data.get("type", "unknown")}')
+
                 message_type = data.get("type")
                 
                 if message_type == "VADEvent":
@@ -102,7 +117,12 @@ class StreamingASRTester:
                     break
                     
         except websockets.exceptions.ConnectionClosed:
-            print("\n[Connection closed by server]")
+            print("\n[RECEIVER] Connection closed by server")
+        except Exception as e:
+            print(f"\n[RECEIVER] Error: {e}")
+            import traceback
+            traceback.print_exc()
+
 
     async def stream_turn(
         self,
@@ -113,14 +133,11 @@ class StreamingASRTester:
         """Stream audio chunks for a single turn"""
         print(f"\n=== Streaming Turn {turn_idx} ===")
         print(f"Total chunks: {len(chunks)}")
-        
-        chunk_interval = self.chunk_duration / self.streaming_speed_multiplier
-        
+                
         for i, chunk in enumerate(chunks):
-            # Calculate current audio time based on chunks sent (how server measures time)
             current_audio_time = self.total_audio_duration_sent
             
-            # Check if we should send force offset command (based on audio duration sent)
+            # Check for force offset
             if self.force_offset_timing is not None and current_audio_time >= self.force_offset_timing:
                 print(f"\n>>> Sending force_vad_offset at audio_time={current_audio_time:.3f}s for turn {turn_idx}")
                 cutoff_command = {
@@ -128,46 +145,48 @@ class StreamingASRTester:
                     "cutoff_target_seg_idx": str(turn_idx)
                 }
                 await websocket.send(json.dumps(cutoff_command))
-                
-                # Clear the timing so we don't send it again
                 self.force_offset_timing = None
+                await asyncio.sleep(0.01)
                 
-                # Wait a bit for server to process
-                await asyncio.sleep(0.1)
-                
-                # Stop streaming this turn
                 print(f"Stopping stream for turn {turn_idx} after chunk {i}/{len(chunks)}")
                 print(f"Total audio duration sent before cutoff: {self.total_audio_duration_sent:.3f}s")
-                return True  # Indicate cutoff happened
+                return True
             
-            # Prepare payload with segment index (base64 encode audio bytes)
+            # Prepare audio payload with segment index (like app.py does)
+            audio_bytes = chunk.tobytes()
+            
+            # Encode audio as base64 and send with seg_idx in JSON format
             payload = {
-                "audio": base64.b64encode(chunk.tobytes()).decode('utf-8'),
-                "sr": self.sample_rate,
-                "enc": "s16le",
-                "seg_idx": turn_idx
+                "seg_idx": str(turn_idx),  # Send the turn index as segment index
+                "audio": base64.b64encode(audio_bytes).decode("ascii"),
             }
             
-            # Send as JSON
+            if i == 0:
+                print(f"[DEBUG] First chunk for turn {turn_idx}:")
+                print(f"  - Chunk samples: {len(chunk)}")
+                print(f"  - Bytes length: {len(audio_bytes)}")
+                print(f"  - Sample rate: {self.sample_rate}")
+                print(f"  - First 5 samples: {chunk[:5]}")
+                print(f"  - Segment index: {turn_idx}")
+            
+            # Send JSON payload with both audio and segment index
             await websocket.send(json.dumps(payload))
             
-            # Track streamed audio and update duration
             self.streamed_audio.append(chunk)
             self.total_audio_duration_sent += self.chunk_duration
             
-            # Wait before sending next chunk (simulating streaming)
-            await asyncio.sleep(chunk_interval)
+            await asyncio.sleep(0.01)  # Faster than realtime streaming
             
-            print(f"Streamed {i + 1}/{len(chunks)} chunks for turn {turn_idx} (audio_time={self.total_audio_duration_sent:.3f}s)")
+            if (i + 1) % 10 == 0 or (i + 1) == len(chunks):
+                print(f"Streamed {i + 1}/{len(chunks)} chunks for turn {turn_idx} (audio_time={self.total_audio_duration_sent:.3f}s)")
         
         print(f"Finished streaming turn {turn_idx} (total audio_time={self.total_audio_duration_sent:.3f}s)")
-        return False  # No cutoff happened
+        return False
 
     async def run_test(self, audio_files: List[str]):
         """Main test execution"""
         print(f"Connecting to {self.server_url}")
         
-        # Load and chunk all audio files
         all_turns_chunks = []
         for i, filepath in enumerate(audio_files):
             print(f"\nLoading audio file: {filepath}")
@@ -176,41 +195,44 @@ class StreamingASRTester:
             all_turns_chunks.append(chunks)
             print(f"Turn {i}: {len(audio_data)} samples -> {len(chunks)} chunks")
         
-        # Connect to server
-        async with websockets.connect(self.server_url) as websocket:
-            print(f"\nConnection established")
-            
-            if self.force_offset_timing is not None:
-                print(f"Force offset will be sent at audio_time={self.force_offset_timing:.3f}s")
-            
-            # Start receiving messages in background
-            receive_task = asyncio.create_task(self.receive_messages(websocket))
-            
-            # Stream each turn
-            for turn_idx, chunks in enumerate(all_turns_chunks):
-                # Stream the turn (force offset timing is checked within)
-                cutoff = await self.stream_turn(
-                    websocket,
-                    turn_idx,
-                    chunks,
-                )
+        try:
+            async with websockets.connect(
+                self.server_url,
+                max_size=10 * 1024 * 1024,  # 10MB max message size
+                ping_interval=20,
+                ping_timeout=10
+            ) as websocket:
+                print(f"\n✓ WebSocket connection established to {self.server_url}")
                 
-                if cutoff:
-                    # Small delay before starting next turn
-                    await asyncio.sleep(0.2)
-            
-            # Wait a bit for final messages
-            print("\nWaiting for final messages...")
-            await asyncio.sleep(2.0)
-            
-            # Close connection
-            await websocket.close()
-            receive_task.cancel()
-            
-            try:
-                await receive_task
-            except asyncio.CancelledError:
-                pass
+                if self.force_offset_timing is not None:
+                    print(f"Force offset will be sent at audio_time={self.force_offset_timing:.3f}s")
+                
+                receive_task = asyncio.create_task(self.receive_messages(websocket))
+                
+                # Give receiver a moment to start
+                await asyncio.sleep(0.1)
+                
+                for turn_idx, chunks in enumerate(all_turns_chunks):
+                    cutoff = await self.stream_turn(websocket, turn_idx, chunks)
+                    
+                    if cutoff:
+                        await asyncio.sleep(0.2)
+                
+                print("\nWaiting for final messages...")
+                await asyncio.sleep(2.0)
+                
+                await websocket.close()
+                receive_task.cancel()
+                
+                try:
+                    await receive_task
+                except asyncio.CancelledError:
+                    pass
+                    
+        except Exception as e:
+            print(f"\n✗ Connection error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def save_streamed_audio(self, output_path: str):
         """Save all streamed audio to a WAV file"""
@@ -218,13 +240,11 @@ class StreamingASRTester:
             print("No audio was streamed")
             return
         
-        # Concatenate all chunks
         full_audio = np.concatenate(self.streamed_audio)
         
-        # Save as WAV
         with wave.open(output_path, 'wb') as wf:
-            wf.setnchannels(1)  # Mono
-            wf.setsampwidth(2)  # 16-bit
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
             wf.setframerate(self.sample_rate)
             wf.writeframes(full_audio.tobytes())
         
@@ -233,12 +253,12 @@ class StreamingASRTester:
         print(f"Duration: {duration:.2f}s, Samples: {len(full_audio)}")
     
     def print_results(self):
-        """Print formatted results for comparison with audio"""
+        """Print formatted results"""
         print("\n" + "="*80)
         print("RESULTS SUMMARY")
         print("="*80)
         
-        print("\n--- VAD Events (relative to WS start) ---")
+        print("\n--- VAD Events ---")
         for event in self.vad_events:
             is_active = event.get("is_active")
             seg_idx = event.get("aud_seg_indx")
@@ -250,8 +270,7 @@ class StreamingASRTester:
             else:
                 print(f"Turn {seg_idx}: VAD OFFSET at {seg_end:.3f}s")
         
-        print("\n--- Word-Level Timestamps (relative to WS start) ---")
-        # Group transcriptions by turn
+        print("\n--- Transcriptions ---")
         turns_transcripts = {}
         for trans in self.transcription_updates:
             seg_idx = trans.get("aud_seg_indx", -1)
@@ -261,8 +280,6 @@ class StreamingASRTester:
         
         for seg_idx in sorted(turns_transcripts.keys()):
             print(f"\nTurn {seg_idx}:")
-            
-            # Get the last (most complete) transcription for this turn
             transcripts = turns_transcripts[seg_idx]
             last_trans = transcripts[-1]
             
@@ -282,7 +299,6 @@ class StreamingASRTester:
                     start_ms = word_info.get("start_ms", 0)
                     end_ms = word_info.get("end_ms")
                     
-                    # Convert to absolute time (relative to WS start)
                     abs_start_s = seg_start_s + (start_ms / 1000.0)
                     
                     if end_ms is not None:
@@ -290,68 +306,37 @@ class StreamingASRTester:
                         print(f"    '{word}': {abs_start_s:.3f}s - {abs_end_s:.3f}s")
                     else:
                         print(f"    '{word}': {abs_start_s:.3f}s - (ongoing)")
-            else:
-                print(f"  No word timestamps available")
         
         print("\n" + "="*80)
 
 
 async def main():
     parser = argparse.ArgumentParser(description="Test streaming ASR with force VAD cutoff")
-    parser.add_argument(
-        "--server-url",
-        default="ws://127.0.0.1:9903/api/realtime/ws",
-        help="WebSocket server URL"
-    )
-    parser.add_argument(
-        "--data-dir",
-        default="./data",
-        help="Directory containing audio files"
-    )
-    parser.add_argument(
-        "--force-offset-timing",
-        type=float,
-        default=None,
-        help="Seconds after connection start to send force offset command"
-    )
-    parser.add_argument(
-        "--speed",
-        type=float,
-        default=10.0,
-        help="Streaming speed multiplier (10.0 = 10x faster than realtime)"
-    )
-    parser.add_argument(
-        "--output-audio",
-        default="./data/test_output_streamed_audio.wav",
-        help="Path to save streamed audio"
-    )
+    parser.add_argument("--server-url", default="ws://127.0.0.1:9903/api/realtime/ws")
+    parser.add_argument("--data-dir", default="./data")
+    parser.add_argument("--force-offset-timing", type=float, default=None)
+    parser.add_argument("--speed", type=float, default=10.0)
+    parser.add_argument("--output-audio", default="./data/test_output_streamed_audio.wav")
     
     args = parser.parse_args()
     
-    # Find audio files
     data_dir = Path(args.data_dir)
     audio_files = [
         str(data_dir / "turn_0.wav"),
         str(data_dir / "turn_1.wav")
     ]
     
-    # Verify files exist
     for filepath in audio_files:
         if not Path(filepath).exists():
             print(f"Error: Audio file not found: {filepath}")
             return
     
-    # Create tester
     tester = StreamingASRTester(
         server_url=args.server_url,
         force_offset_timing=args.force_offset_timing,
-        streaming_speed_multiplier=args.speed
     )
     
-    # Run test
     await tester.run_test(audio_files)
-    
-    # Save results
     tester.save_streamed_audio(args.output_audio)
     tester.print_results()
 

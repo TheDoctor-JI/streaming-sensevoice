@@ -285,6 +285,9 @@ async def websocket_endpoint(websocket: WebSocket):
         force_cutoff_pending = False  # Track if force cutoff is pending
         force_cutoff_target_seg = -1  # Track target segment for force cutoff
 
+        samplerate = config.SAMPLERATE
+        encoding = "s16le"
+        
         transcription_response: TranscriptionResponse = None
         while True:
             message = await websocket.receive()
@@ -296,10 +299,8 @@ async def websocket_endpoint(websocket: WebSocket):
             payload_bytes = message.get("bytes")
             payload_text = message.get("text")
             aud_seg_indx = -1
+            samples_i16: np.ndarray | None = None ## Reset the audio storage
 
-            samples_i16: np.ndarray | None = None
-            samplerate = config.SAMPLERATE
-            encoding = "s16le"
 
             if payload_bytes is not None:
                 if len(payload_bytes) % 2 != 0:
@@ -318,17 +319,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Check for force cutoff command first
                     command = structured_payload.get("command")
                     if command == "force_vad_offset":
-                        seg_idx_str = structured_payload.get("cutoff_target_seg_idx")
+                        target_seg_idx_str = structured_payload.get("cutoff_target_seg_idx")
                         try:
-                            force_cutoff_target_seg = int(seg_idx_str)
+                            force_cutoff_target_seg = int(target_seg_idx_str)
                             force_cutoff_pending = True
                             logger.info(f"Force VAD cutoff command received for seg_idx={force_cutoff_target_seg}")
-                            # Skip audio extraction and jump directly to buffer processing
-                            samples_i16 = None
+
                         except (TypeError, ValueError):
-                            logger.warning(f"Invalid seg_idx in force_vad_offset: {seg_idx_str}")
+                            logger.warning(f"Invalid seg_idx in force_vad_offset: {target_seg_idx_str}")
                             continue
-                    else:
+                    else:##Skip audio extraction if force cutoff
                         aud_seg_indx_raw = structured_payload.get("seg_idx")
                         if aud_seg_indx_raw is not None:
                             try:
@@ -339,35 +339,31 @@ async def websocket_endpoint(websocket: WebSocket):
                             except (TypeError, ValueError):
                                 pass
 
-                        # Skip audio extraction if force cutoff command was received
-                        if samples_i16 is None:
-                            # Force cutoff command received - skip all audio extraction
-                            pass
-                        else:
-                            audio_field = structured_payload.get("audio")
-                            samplerate = structured_payload.get("sr", samplerate)
-                            encoding = structured_payload.get("enc", encoding)
+                        audio_field = structured_payload.get("audio")
+                        samplerate = structured_payload.get("sr", samplerate)
+                        encoding = structured_payload.get("enc", encoding)
 
-                            if samplerate != config.SAMPLERATE:
-                                raise ValueError("Sample rate mismatch")
+                        if samplerate != config.SAMPLERATE:
+                            raise ValueError("Sample rate mismatch")
 
-                            if isinstance(audio_field, str):
-                                try:
-                                    audio_field = base64.b64decode(audio_field)
-                                except Exception:
-                                    logger.warning("Failed to decode base64 audio payload; ignoring")
-                                    continue
-                                samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
-                            elif isinstance(audio_field, list):
-                                samples_i16 = np.asarray(audio_field, dtype=np.int16)
-                            elif isinstance(audio_field, (bytes, bytearray)):
-                                if len(audio_field) % 2 != 0:
-                                    logger.warning("Dropping trailing byte from odd-length audio payload")
-                                    audio_field = audio_field[:-1]
-                                samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
-                            else:
-                                logger.warning("Unsupported audio payload type: {}", type(audio_field))
+                        if isinstance(audio_field, str):
+                            try:
+                                audio_field = base64.b64decode(audio_field)
+                            except Exception:
+                                logger.warning("Failed to decode base64 audio payload; ignoring")
                                 continue
+                            samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
+                        elif isinstance(audio_field, list):
+                            samples_i16 = np.asarray(audio_field, dtype=np.int16)
+                        elif isinstance(audio_field, (bytes, bytearray)):
+                            if len(audio_field) % 2 != 0:
+                                logger.warning("Dropping trailing byte from odd-length audio payload")
+                                audio_field = audio_field[:-1]
+                            samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
+                        else:
+                            logger.warning("Unsupported audio payload type: {}", type(audio_field))
+                            continue
+
                 else:
                     audio_field = structured_payload
 
