@@ -188,6 +188,52 @@ async def worklet_module() -> FileResponse:
     return FileResponse("pcm-worklet-processor.js", media_type="application/javascript")
 
 
+def reset_vad_state_preserve_timing(vad_iterator: VADIterator):
+    """
+    Selectively reset VAD state while preserving timing counters.
+    This allows the VAD to start fresh detection without resetting absolute timestamps.
+    
+    Resets:
+    - VAD model internal state (h, c for v4 or state, context for v5)
+    - Speech detection flags (triggered, temp_end)
+    - Speech samples buffer
+    - FrameQueue remained_samples buffer
+    
+    Preserves:
+    - FrameQueue.current_sample (absolute sample counter)
+    - FrameQueue.cache_start (absolute cache position)
+    - FrameQueue.cached_samples (maintains timing consistency)
+    """
+    # Reset VAD model state (version-dependent)
+    if vad_iterator.version == "v4":
+        vad_iterator.h = np.zeros((2, 1, 64), dtype=np.float32)
+        vad_iterator.c = np.zeros((2, 1, 64), dtype=np.float32)
+    else:  # v5
+        vad_iterator.state = np.zeros((2, 1, 128), dtype=np.float32)
+        vad_iterator.context = np.zeros((1, vad_iterator.context_size), dtype=np.float32)
+    
+    # Reset VAD detection flags
+    vad_iterator.triggered = False
+    vad_iterator.temp_end = 0
+    vad_iterator.speech_samples = np.empty(0, dtype=np.float32)
+    
+    # Clear the remained_samples buffer in the queue to avoid stale data
+    vad_iterator.queue.remained_samples = np.empty(0, dtype=np.float32)
+    
+    # Reset resampler state if present to avoid carryover artifacts
+    if vad_iterator.queue.resampler is not None:
+        vad_iterator.queue.resampler = soxr.ResampleStream(
+            int(vad_iterator.sample_rate),
+            int(vad_iterator.model_sample_rate),
+            num_channels=1
+        )
+    
+    logger.debug(
+        f"VAD state reset (timing preserved): current_sample={vad_iterator.queue.current_sample}, "
+        f"cache_start={vad_iterator.queue.cache_start}"
+    )
+
+
 @app.websocket("/api/realtime/ws")
 async def websocket_endpoint(websocket: WebSocket):
     try:
@@ -572,8 +618,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                     logger.debug(f"Force cutoff: sent VAD offset for seg_idx={force_cutoff_target_seg}")
                     
-                    # Reset VAD state by resetting -- we need extra effort to maintian the size of cached chunks so that the timing returned by the vad remains consistent for subsequent events, even after the forced offset.
-                    vad_iterator.reset()
+                    # Reset VAD state while preserving timing counters for consistent timestamps using customized reset method
+                    reset_vad_state_preserve_timing(vad_iterator)
         
                     # Reset ASR state as well
                     sensevoice_model.reset()
