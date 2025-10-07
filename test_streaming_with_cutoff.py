@@ -213,10 +213,8 @@ class StreamingASRTester:
                 await asyncio.sleep(0.1)
                 
                 for turn_idx, chunks in enumerate(all_turns_chunks):
-                    cutoff = await self.stream_turn(websocket, turn_idx, chunks)
+                    await self.stream_turn(websocket, turn_idx, chunks)
                     
-                    if cutoff:
-                        await asyncio.sleep(0.2)
                 
                 print("\nWaiting for final messages...")
                 await asyncio.sleep(2.0)

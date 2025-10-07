@@ -572,14 +572,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                     logger.debug(f"Force cutoff: sent VAD offset for seg_idx={force_cutoff_target_seg}")
                     
-                    # Reset VAD state by creating new iterator
-                    vad_iterator = VADIterator(
-                        version=config.SILEROVAD_VERSION,
-                        threshold=vad_threshold,
-                        min_silence_duration_ms=vad_min_silence_duration_ms,
-                    )
-                    
-                    # Reset ASR state
+                    # Reset VAD state by resetting -- we need extra effort to maintian the size of cached chunks so that the timing returned by the vad remains consistent for subsequent events, even after the forced offset.
+                    vad_iterator.reset()
+        
+                    # Reset ASR state as well
                     sensevoice_model.reset()
                     
                     # Update state
