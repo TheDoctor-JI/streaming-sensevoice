@@ -53,6 +53,7 @@ import uuid
 import time
 
 import base64
+import traceback
 
 class Config(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=True):
     HOST: str = Field("127.0.0.1", description="Host")
@@ -358,7 +359,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     structured_payload = json.loads(payload_text)
                 except json.JSONDecodeError:
-                    logger.warning("Received non-JSON text payload; ignoring")
+                    logger.warning(f"Received non-JSON text payload; ignoring. Full payload: {payload_text}")
                     continue
 
                 if isinstance(structured_payload, dict):
@@ -372,7 +373,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             logger.info(f"Force VAD cutoff command received for seg_idx={force_cutoff_target_seg}")
 
                         except (TypeError, ValueError):
-                            logger.warning(f"Invalid seg_idx in force_vad_offset: {target_seg_idx_str}")
+                            logger.warning(f"Invalid seg_idx in force_vad_offset: {target_seg_idx_str}\nFull payload: {payload_text}\nFull traceback:\n{traceback.format_exc()}")
                             continue
                     else:##Skip audio extraction if force cutoff
                         aud_seg_indx_raw = structured_payload.get("seg_idx")
@@ -383,7 +384,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 if aud_seg_indx >= 0:
                                     current_seg_idx = aud_seg_indx
                             except (TypeError, ValueError):
-                                pass
+                                logger.warning(f"Invalid seg_idx value: {aud_seg_indx_raw}\nFull payload: {payload_text}\nFull traceback:\n{traceback.format_exc()}")
 
                         audio_field = structured_payload.get("audio")
                         samplerate = structured_payload.get("sr", samplerate)
@@ -396,7 +397,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             try:
                                 audio_field = base64.b64decode(audio_field)
                             except Exception:
-                                logger.warning("Failed to decode base64 audio payload; ignoring")
+                                logger.warning(f"Failed to decode base64 audio payload; ignoring\nFull traceback:\n{traceback.format_exc()}")
                                 continue
                             samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
                         elif isinstance(audio_field, list):
@@ -420,7 +421,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         try:
                             audio_field = base64.b64decode(audio_field)
                         except Exception:
-                            logger.warning("Failed to decode base64 audio payload; ignoring")
+                            logger.warning(f"Failed to decode base64 audio payload; ignoring. Full traceback:\n{traceback.format_exc()}")
                             continue
                         samples_i16 = np.frombuffer(audio_field, dtype=np.int16)
                     elif isinstance(audio_field, list):
@@ -636,7 +637,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 audio_buffer = np.array([], dtype=np.float32)
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        logger.info(f"WebSocket disconnected.\nFull traceback:\n{traceback.format_exc()}")
     finally:
         sensevoice_model.reset()
         del sensevoice_model
