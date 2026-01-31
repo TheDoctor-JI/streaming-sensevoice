@@ -44,7 +44,11 @@ from pydantic_settings import BaseSettings
 
 from pysilero import VADIterator
 
-from loguru import logger
+# Use local logger instead of loguru for consistent logging with the rest of the system
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from logger.logger import setup_logger
 
 import numpy as np
 
@@ -77,6 +81,17 @@ class Config(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=Tr
 
 
 config = Config()
+
+# Initialize logger for the streaming ASR server
+logger = setup_logger(
+    logger_name='streaming_asr_server',
+    file_log_level="DEBUG",
+    terminal_log_level="INFO"
+)
+logger.info("Streaming ASR server logger initialized")
+
+# Track active sessions for monitoring
+active_sessions = {}  # session_id -> {start_time, last_activity, audio_chunks_received, transcripts_sent}
 
 device_raw = config.DEVICE.strip()
 device_lower = device_raw.lower()
@@ -237,13 +252,29 @@ def reset_vad_state_preserve_timing(vad_iterator: VADIterator):
 
 @app.websocket("/api/realtime/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    session_id = None
     try:
         await websocket.accept()
 
         session_start_walltime = time.time()
         
         session_id = str(uuid.uuid4())
-        logger.info(f"Session {session_id} opened")
+        
+        # Get client info for logging
+        client_host = websocket.client.host if websocket.client else "unknown"
+        client_port = websocket.client.port if websocket.client else "unknown"
+        
+        # Track session
+        active_sessions[session_id] = {
+            'start_time': session_start_walltime,
+            'last_activity': session_start_walltime,
+            'audio_chunks_received': 0,
+            'transcripts_sent': 0,
+            'client': f"{client_host}:{client_port}"
+        }
+        
+        logger.info(f"[SESSION {session_id}] New WebSocket connection opened from {client_host}:{client_port}")
+        logger.info(f"[SESSION {session_id}] Active sessions count: {len(active_sessions)}")
 
         query_params = parse_qs(websocket.scope["query_string"].decode())
 
@@ -267,6 +298,8 @@ async def websocket_endpoint(websocket: WebSocket):
             requested_language = requested_language.lower()
         else:
             requested_language = config.LANGUAGE
+
+        logger.debug(f"[SESSION {session_id}] Config: chunk_duration={chunk_duration}, vad_threshold={vad_threshold}, vad_silence_ms={vad_min_silence_duration_ms}, language={requested_language}")
 
         available_languages: set[str] | None = None
         try:
@@ -313,7 +346,7 @@ async def websocket_endpoint(websocket: WebSocket):
             )
             return
 
-        logger.info(f"Session {session_id} configured with language='{requested_language}'")
+        logger.info(f"[SESSION {session_id}] configured with language='{requested_language}'")
         vad_iterator = VADIterator(
             version=config.SILEROVAD_VERSION,
             threshold=vad_threshold,
@@ -445,6 +478,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 samples = samples_i16.astype(np.float32) / 32768.0
                 audio_buffer = np.concatenate((audio_buffer, samples))
+                
+                # Update session activity tracking
+                if session_id in active_sessions:
+                    active_sessions[session_id]['last_activity'] = time.time()
+                    active_sessions[session_id]['audio_chunks_received'] += 1
 
             while len(audio_buffer) >= chunk_size:
                 chunk = audio_buffer[:chunk_size]
@@ -466,8 +504,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         asrDetected = False
                         in_speech = True  # Track that we're now in speech
 
-                        logger.debug(
-                            f"{speech_count}: VAD start: {currentAudioBeginTime}"
+                        logger.info(
+                            f"[SESSION {session_id}] VAD START at {currentAudioBeginTime:.3f}s (speech_count={speech_count})"
                         )
                         await websocket.send_json(
                             VADEvent(
@@ -528,6 +566,11 @@ async def websocket_endpoint(websocket: WebSocket):
                             await websocket.send_json(
                                 transcription_response.model_dump()
                             )
+                            
+                            # Track transcript sends
+                            if session_id in active_sessions:
+                                active_sessions[session_id]['transcripts_sent'] += 1
+                                active_sessions[session_id]['last_activity'] = time.time()
 
                     if is_last:
                         in_speech = False  # Track that speech has ended
@@ -545,12 +588,12 @@ async def websocket_endpoint(websocket: WebSocket):
                             await websocket.send_json(
                                 transcription_response.model_dump()
                             )
-                            logger.debug(
-                                f"{speech_count}: VAD end: {speech_dict['end'] / config.SAMPLERATE}\n{transcription_response.data.raw_text}\n{str(transcription_response.data.timestamps)}"
+                            logger.info(
+                                f"[SESSION {session_id}] VAD END at {speech_dict['end'] / config.SAMPLERATE:.3f}s - FINAL transcript: '{transcription_response.data.raw_text[:50]}{'...' if len(transcription_response.data.raw_text) > 50 else ''}'"
                             )
                         else:
                             logger.debug(
-                                f"{speech_count}: VAD end: {speech_dict['end'] / config.SAMPLERATE}\nNo Speech"
+                                f"[SESSION {session_id}] VAD END at {speech_dict['end'] / config.SAMPLERATE:.3f}s - No speech detected"
                             )
                         await websocket.send_json(
                             VADEvent(
@@ -637,13 +680,27 @@ async def websocket_endpoint(websocket: WebSocket):
                 audio_buffer = np.array([], dtype=np.float32)
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected.\nFull traceback:\n{traceback.format_exc()}")
+        session_info = active_sessions.get(session_id, {})
+        duration = time.time() - session_info.get('start_time', time.time())
+        chunks = session_info.get('audio_chunks_received', 0)
+        transcripts = session_info.get('transcripts_sent', 0)
+        logger.info(f"[SESSION {session_id}] WebSocket disconnected normally. Duration: {duration:.1f}s, Chunks received: {chunks}, Transcripts sent: {transcripts}")
+    except Exception as e:
+        logger.error(f"[SESSION {session_id}] Unexpected error in WebSocket handler: {e}\nFull traceback:\n{traceback.format_exc()}")
     finally:
-        sensevoice_model.reset()
-        del sensevoice_model
-        del vad_iterator
-        del audio_buffer
-        logger.info(f"Session {session_id} closed")
+        # Clean up session tracking
+        if session_id and session_id in active_sessions:
+            session_info = active_sessions.pop(session_id)
+            duration = time.time() - session_info.get('start_time', time.time())
+            logger.info(f"[SESSION {session_id}] Session closed after {duration:.1f}s. Remaining active sessions: {len(active_sessions)}")
+        
+        try:
+            sensevoice_model.reset()
+            del sensevoice_model
+            del vad_iterator
+            del audio_buffer
+        except Exception as cleanup_error:
+            logger.warning(f"[SESSION {session_id}] Error during cleanup: {cleanup_error}")
 
 
 if __name__ == "__main__":
