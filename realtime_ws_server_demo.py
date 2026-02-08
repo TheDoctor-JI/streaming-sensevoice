@@ -32,6 +32,26 @@ python realtime_ws_server_demo.py --help
 ```
 """
 
+# ==============================================================================
+# FAST MODEL LOADING TOGGLE
+# ==============================================================================
+# Set to True to use cached models without network checks (fast startup ~3s)
+# Set to False for first-time download or to check for model updates (~30s)
+USE_LOCAL_MODELS_ONLY = True
+# ==============================================================================
+
+# Patch modelscope BEFORE importing pysilero to avoid slow network checks
+if USE_LOCAL_MODELS_ONLY:
+    from modelscope.hub.snapshot_download import snapshot_download as _orig_download
+    import sys
+    _ms_module = sys.modules['modelscope.hub.snapshot_download']
+    
+    def _patched_snapshot_download(*args, **kwargs):
+        kwargs['local_files_only'] = True
+        return _orig_download(*args, **kwargs)
+    
+    _ms_module.snapshot_download = _patched_snapshot_download
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, FileResponse
