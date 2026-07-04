@@ -52,7 +52,7 @@ if USE_LOCAL_MODELS_ONLY:
     
     _ms_module.snapshot_download = _patched_snapshot_download
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, UploadFile, File
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,6 +75,8 @@ import numpy as np
 import json
 import uuid
 import time
+import io
+import wave
 
 import base64
 import traceback
@@ -98,6 +100,7 @@ class Config(BaseSettings, cli_parse_args=True, cli_use_class_docs_for_groups=Tr
         550, description="VAD min slience duration (ms)"
     )
     VAD_THRESHOLD: float = Field(0.5, description="VAD threshold")
+    BEAM_SIZE: int = Field(3, description="CTC beam search width (larger = better word boundaries, slower; default 3)")
 
 
 config = Config()
@@ -213,6 +216,91 @@ class VADEvent(BaseModel):
     segment_end_s: float | None = None
     session_start_walltime: float | None = None
     aud_seg_indx: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Batch transcription endpoint — transcribes a full WAV file without VAD resets.
+# ---------------------------------------------------------------------------
+
+class BatchTranscribeResponse(BaseModel):
+    text: str
+    word_timestamps: list[WordTimestamp]
+
+
+def _resample_pcm16_to_16k(pcm_bytes: bytes, src_sr: int) -> bytes:
+    """Resample int16 PCM to 16 kHz if *src_sr* differs."""
+    if src_sr == 16000:
+        return pcm_bytes
+    import scipy.signal
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float64)
+    target_len = int(len(samples) * 16000 / src_sr)
+    resampled = scipy.signal.resample(samples, target_len)
+    return np.clip(np.round(resampled), -32768, 32767).astype(np.int16).tobytes()
+
+
+@app.post("/api/transcribe", response_model=BatchTranscribeResponse)
+async def batch_transcribe(file: UploadFile = File(...)):
+    """
+    Transcribe a complete WAV file in one pass (no VAD, no ASR resets).
+
+    Accepts a WAV file upload (multipart form).  Returns the full transcript
+    and per-word timestamps with absolute millisecond offsets from audio start.
+    """
+    raw = await file.read()
+    if len(raw) < 44:
+        raise HTTPException(status_code=400, detail="File too small to be a valid WAV")
+
+    # Parse WAV header for sample rate and raw PCM
+    try:
+        with wave.open(io.BytesIO(raw), "rb") as wf:
+            src_sr = wf.getframerate()
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            pcm = wf.readframes(wf.getnframes())
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid WAV file: {exc}")
+
+    # Convert to 16 kHz mono s16le
+    if nchannels > 1 or sampwidth != 2:
+        # Convert to mono float
+        arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float64).reshape(-1, nchannels)
+        mono = arr.mean(axis=1)
+        pcm = np.clip(np.round(mono), -32768, 32767).astype(np.int16).tobytes()
+
+    if src_sr != 16000:
+        pcm = _resample_pcm16_to_16k(pcm, src_sr)
+
+    samples = np.frombuffer(pcm, dtype=np.int16).tolist()
+    logger.info(
+        f"[batch_transcribe] file={file.filename} src_sr={src_sr} "
+        f"duration={len(samples)/16000:.1f}s"
+    )
+
+    # Create a fresh model instance for this request (no state leakage)
+    model = StreamingSenseVoice(
+        model=config.SENSEVOICE_MODEL_PATH,
+        device=config.DEVICE,
+        language="auto",
+        beam_size=config.BEAM_SIZE,
+    )
+    chunk = int(0.1 * 16000)
+    last_result = {}
+    for i in range(0, len(samples), chunk):
+        is_last = i + chunk >= len(samples)
+        batch = samples[i:i + chunk]
+        for res in model.streaming_inference(batch, is_last):
+            if res.get("text"):
+                last_result = res
+    model.reset()
+
+    word_ts = last_result.get("word_timestamps") or []
+    text = last_result.get("text", "")
+
+    return BatchTranscribeResponse(
+        text=text,
+        word_timestamps=[WordTimestamp(**wt) for wt in word_ts],
+    )
+
 
 @app.get("/")
 async def clientHost():
