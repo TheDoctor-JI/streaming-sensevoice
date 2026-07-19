@@ -1,6 +1,3 @@
-# For releasing ports
-kill -9 $(lsof -t -i:9903)
-
 clear
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate streaming_asr_env
