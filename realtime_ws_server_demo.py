@@ -174,8 +174,23 @@ app.add_middleware(
 
 from streaming_sensevoice import StreamingSenseVoice
 
-# load model on startup
-StreamingSenseVoice.load_model(model=config.SENSEVOICE_MODEL_PATH, device=config.DEVICE)
+# Exercise model kernels before binding the server port. Loading weights alone
+# succeeds even when an old PyTorch build cannot execute on the selected GPU.
+def warmup_model():
+    import torch
+
+    logger.info(f"Warming ASR on {config.DEVICE}; torch={torch.__version__}, CUDA={torch.version.cuda}")
+    model = StreamingSenseVoice(
+        model=config.SENSEVOICE_MODEL_PATH, device=config.DEVICE, language=config.LANGUAGE
+    )
+    with torch.inference_mode():
+        model.inference(torch.zeros(model.caches_shape))
+    if config.DEVICE.startswith("cuda"):
+        torch.cuda.synchronize()
+    logger.info("ASR inference warmup passed")
+
+
+warmup_model()
 
 
 class WordTimestamp(BaseModel):
@@ -313,7 +328,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "vad_min_silence_duration_ms", config.VAD_MIN_SILENCE_DURATION_MS
             )
         )
-        requested_language = query_params.get("language", [config.LANGUAGE])[0]
+        requested_language = query_params.get("language", config.LANGUAGE)
         if requested_language:
             requested_language = requested_language.lower()
         else:
